@@ -67,6 +67,59 @@ pub(super) fn assert_pagination_fixture_font(layout: &DocLayout) {
     assert!(paragraphs > 0, "font assertions must inspect actual laid-out paragraphs");
 }
 
+/// Measure the actual plain fixture face and point size, then expose an execution witness.
+fn assert_plain_pagination_fixture_font_observed(layout: &DocLayout) {
+    assert_pagination_fixture_font(layout);
+    let mut styles = 0;
+    for page in &layout.pages {
+        for item in &page.items {
+            if let Placed::Lines { para, .. } = item {
+                styles += para.styles.len();
+            }
+        }
+    }
+    assert!(styles > 0, "font evidence must inspect actual style runs");
+    eprintln!("LAYOUT_FIXTURE_FONT plain styles={styles} body_size=12 family=SourceSans3 face=Regular exact_bytes=true");
+}
+
+/// Footnote Text keeps its existing 10 pt size; body text is the explicit 12 pt fixture.
+/// Check the actual face bytes and drawn sizes without changing either story's formatting.
+fn assert_footnoted_pagination_fixture_font(layout: &DocLayout) {
+    let mut body_styles = 0;
+    let mut note_styles = 0;
+    for page in &layout.pages {
+        for item in &page.items {
+            if let Placed::Lines { story, para, .. } = item {
+                let expected: f32 = match story {
+                    StoryRef::Body => 12.0,
+                    StoryRef::Part(_) => 10.0,
+                };
+                for style in &para.styles {
+                    match story {
+                        StoryRef::Body => body_styles += 1,
+                        StoryRef::Part(_) => note_styles += 1,
+                    }
+                    assert_eq!(style.rc.font, WRAP_TEST_FONT, "the fixture requests its bundled face");
+                    assert_eq!(style.face.family, WRAP_TEST_FONT, "the fixture must not silently substitute another family");
+                    assert_eq!(style.face.style, "Regular", "the fixture must resolve the intended regular face");
+                    assert_eq!(style.rc.size, expected, "body/Footnote Text keep their declared point sizes");
+                    assert!(matches!(style.rc.vert_align, wordcraft_doc::props::VertAlign::Baseline | wordcraft_doc::props::VertAlign::Superscript));
+                    let drawn = if style.rc.vert_align == wordcraft_doc::props::VertAlign::Baseline { expected } else { expected * 0.65 };
+                    assert_eq!(style.size, drawn, "the actual drawn size keeps the declared baseline/superscript contract");
+                    assert!(
+                        style.face.data() == include_bytes!("../../../assets/fonts/SourceSans3-Regular.ttf").as_slice(),
+                        "the selected face must be the exact already-bundled regular font bytes"
+                    );
+                }
+            }
+        }
+    }
+    assert!(body_styles > 0 && note_styles > 0, "font evidence must inspect actual body and footnote style runs");
+    eprintln!(
+        "LAYOUT_FIXTURE_FONT notes body_styles={body_styles} note_styles={note_styles} body_size=12 note_size=10 family=SourceSans3 face=Regular exact_bytes=true"
+    );
+}
+
 /// Preserve the 22 short filler paragraphs while giving the following row a measured boundary.
 fn pagination_filler_leaving(room: f32) -> Document {
     let lines: Vec<String> = (1..=22).map(|i| format!("Filler {i}")).collect();
@@ -5797,7 +5850,7 @@ fn leading_spaces_keep_their_width_in_justified_lines() {
     // before them): Word ignores those, and a bookmark, there too; the first character is still
     // the one after the spaces.
     let first_x = |align: Align, hidden: &str, float: bool| {
-        let mut d = Document::from_text(&format!("{hidden}{spaces}{body}"));
+        let mut d = pagination_fixture_document(&format!("{hidden}{spaces}{body}"));
         d.format_paragraphs(&Pos::body(0, 0), &Pos::body(0, 0), &|p| p.align = Some(align)).unwrap();
         if !hidden.is_empty() {
             d.format_range(&Pos::body(0, 0), &Pos::body(0, hidden.len()), &|c| c.hidden = Some(true)).unwrap();
@@ -5808,6 +5861,7 @@ fn leading_spaces_keep_their_width_in_justified_lines() {
         let text = d.body[0].as_para().unwrap().text.clone();
         let lead = text.len() - body.len();
         let l = lay(&d);
+        assert_plain_pagination_fixture_font_observed(&l);
         let (para, x0) =
             l.pages[0].items.iter().find_map(|it| if let Placed::Lines { para, x, .. } = it { Some((para.clone(), *x)) } else { None }).unwrap();
         assert!(para.lines.len() > 1, "the paragraph wraps");
@@ -6206,7 +6260,7 @@ fn a_float_anchored_two_pages_into_its_paragraph_is_drawn_on_that_page() {
 /// A long paragraph with a long footnote on page one, and a page-placed square float anchored at
 /// line `k` of page two as laid out without it.
 fn footnoted_float(k: usize) -> DocLayout {
-    let mut d = Document::from_text(&"The quick brown fox jumps over the lazy dog. ".repeat(400));
+    let mut d = pagination_fixture_document(&"The quick brown fox jumps over the lazy dog. ".repeat(400));
     let mut note = wordcraft_doc::Paragraph::with_text(&"The note text runs on for a while. ".repeat(30), Default::default()).styled("FootnoteText");
     note.props.space_after = Some(0.0);
     let id = d.add_part(wordcraft_doc::PartKind::Footnote, vec![wordcraft_doc::para_block(note)]);
@@ -6219,7 +6273,9 @@ fn footnoted_float(k: usize) -> DocLayout {
     let anchor = lines_on(&lay(&d), 1)[k].2;
     let f = wordcraft_doc::para::Float { wrap: wordcraft_doc::para::Wrap::Square, ..page_float(72.0, 300.0) };
     d.insert_object(&Pos::body(0, anchor), rect_shape(100.0, 50.0, f), &Default::default()).unwrap();
-    lay(&d)
+    let l = lay(&d);
+    assert_footnoted_pagination_fixture_font(&l);
+    l
 }
 
 /// #4250: a footnote on page one leaves less room there than its lines alone suggest; a float
@@ -6245,7 +6301,11 @@ fn a_float_whose_anchor_comes_back_to_page_one_stays_there_with_the_text_around_
 /// back to page two; the note goes with it, once, not left on page one as well.
 #[test]
 fn a_footnote_pushed_on_by_a_float_coming_back_is_on_its_reference_s_page_only() {
-    let mut d = Document::from_text(&"The quick brown fox jumps over the lazy dog. ".repeat(400));
+    let mut d = pagination_fixture_document(&"The quick brown fox jumps over the lazy dog. ".repeat(400));
+    // The short note must fit with the unwrapped anchor, but not with the wrapped one.
+    // At the original height its reservation misses the unwrapped line by 0.6 pt.
+    d.last_section.page_h += 1.0;
+    assert_eq!(d.last_section.page_h, 793.0, "the fixture declares its physical page boundary");
     let note = |text: &str| {
         let mut p = wordcraft_doc::Paragraph::with_text(text, Default::default()).styled("FootnoteText");
         p.props.space_after = Some(0.0);
@@ -6259,7 +6319,41 @@ fn a_footnote_pushed_on_by_a_float_coming_back_is_on_its_reference_s_page_only()
     d.insert_object(&Pos::body(0, anchor), noteref(short), &Default::default()).unwrap();
     let f = wordcraft_doc::para::Float { wrap: wordcraft_doc::para::Wrap::Square, ..page_float(72.0, 300.0) };
     d.insert_object(&Pos::body(0, anchor), rect_shape(100.0, 50.0, f), &Default::default()).unwrap();
+    // Keep the same anchor object and every text/font/note property; disable only its wrap in a copy.
+    let mut without_wrap = d.clone();
+    without_wrap.para_mut(StoryRef::Body, &Path::top(0)).unwrap().object_at_mut(anchor).unwrap().float_mut().unwrap().wrap =
+        wordcraft_doc::para::Wrap::BehindText;
+    assert_eq!(without_wrap.last_section, d.last_section);
+    assert_eq!(without_wrap.styles, d.styles);
+    assert_eq!(without_wrap.parts, d.parts, "both note contents and formatting stay exact");
+    assert_eq!(without_wrap.para(StoryRef::Body, &Path::top(0)).unwrap().text, d.para(StoryRef::Body, &Path::top(0)).unwrap().text);
+    let anchor_range = |doc: &Document, layout: &DocLayout| {
+        let paragraph = doc.para(StoryRef::Body, &Path::top(0)).unwrap();
+        let oi = paragraph.object_offsets().iter().position(|off| *off == anchor).unwrap();
+        let (para, first, end) = layout.pages[0]
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Placed::Lines { story: StoryRef::Body, path, para, l0, l1, .. } if path.0 == [0] && *l0 == 0 => Some((para, *l0, *l1)),
+                _ => None,
+            })
+            .unwrap();
+        let line = super::floats::anchor_lines(paragraph, para)[oi].unwrap();
+        (line, first, end)
+    };
+    let unwrapped_layout = lay(&without_wrap);
+    assert_footnoted_pagination_fixture_font(&unwrapped_layout);
+    let unwrapped_range = anchor_range(&without_wrap, &unwrapped_layout);
+    assert!(
+        unwrapped_range.1 <= unwrapped_range.0 && unwrapped_range.0 < unwrapped_range.2,
+        "without its wrap the anchor must be eligible on page one: {unwrapped_range:?}"
+    );
     let l = lay(&d);
+    assert_footnoted_pagination_fixture_font(&l);
+    let wrapped_range = anchor_range(&d, &l);
+    assert!(wrapped_range.0 >= wrapped_range.2, "with its wrap the anchor must be late: {wrapped_range:?}");
+    assert!(unwrapped_range.0 < wrapped_range.0, "removing the float's wrap must bring the anchor line back");
+    eprintln!("FLOAT_NOTE_GEOMETRY page_h={} unwrapped={unwrapped_range:?} wrapped={wrapped_range:?}", d.last_section.page_h);
     assert_eq!(shapes(&l.pages[0].items).len(), 1, "the float stays on page one");
     let at = anchor + wordcraft_doc::para::OBJ.len_utf8();
     let ref_page = (0..l.pages.len()).rfind(|&pi| lines_on(&l, pi).first().is_some_and(|f| f.2 <= at));
@@ -6276,7 +6370,7 @@ fn a_footnote_pushed_on_by_a_float_coming_back_is_on_its_reference_s_page_only()
 /// there; the other is still drawn on page two.
 #[test]
 fn of_two_floats_held_back_only_the_one_whose_anchor_comes_back_stays_on_page_one() {
-    let mut d = Document::from_text(&"The quick brown fox jumps over the lazy dog. ".repeat(400));
+    let mut d = pagination_fixture_document(&"The quick brown fox jumps over the lazy dog. ".repeat(400));
     let mut note = wordcraft_doc::Paragraph::with_text(&"The note text runs on for a while. ".repeat(30), Default::default()).styled("FootnoteText");
     note.props.space_after = Some(0.0);
     let id = d.add_part(wordcraft_doc::PartKind::Footnote, vec![wordcraft_doc::para_block(note)]);
@@ -6287,6 +6381,7 @@ fn of_two_floats_held_back_only_the_one_whose_anchor_comes_back_stays_on_page_on
     d.insert_object(&Pos::body(0, lines[3].2), rect_shape(100.0, 50.0, f(400.0)), &Default::default()).unwrap();
     d.insert_object(&Pos::body(0, lines[0].2), rect_shape(100.0, 50.0, f(300.0)), &Default::default()).unwrap();
     let l = lay(&d);
+    assert_footnoted_pagination_fixture_font(&l);
     let ys = |pi: usize| shapes(&l.pages[pi].items).iter().map(|r| r.y).collect::<Vec<_>>();
     assert_eq!((ys(0).len(), ys(1).len()), (1, 1), "one on each page: {:?} {:?}", ys(0), ys(1));
 }
@@ -6321,16 +6416,19 @@ fn a_float_anchored_on_a_line_a_footnote_pushes_on_is_drawn_on_the_next_page() {
 fn a_float_anchored_on_a_line_widow_control_takes_on_is_drawn_on_the_next_page() {
     // A paragraph of three pages whose last two lines are on the third only by widow control.
     let (mut d, l) = (150..300)
-        .map(|k| Document::from_text(&"The quick brown fox jumps over the lazy dog. ".repeat(k)))
+        .map(|k| pagination_fixture_document(&"The quick brown fox jumps over the lazy dog. ".repeat(k)))
         .map(|d| {
             let l = lay(&d);
+            assert_plain_pagination_fixture_font_observed(&l);
             (d, l)
         })
         .find(|(_, l)| l.pages.len() == 3 && lines_on(l, 2).len() == 2 && lines_on(l, 1).len() < lines_on(l, 0).len())
         .expect("a paragraph ending in a widow");
     let anchor = lines_on(&l, 2)[0].2 + "The ".len();
     d.insert_object(&Pos::body(0, anchor), rect_shape(100.0, 50.0, page_float(72.0, 300.0)), &Default::default()).unwrap();
-    let per_page: Vec<usize> = lay(&d).pages.iter().map(|p| shapes(&p.items).len()).collect();
+    let floated = lay(&d);
+    assert_plain_pagination_fixture_font_observed(&floated);
+    let per_page: Vec<usize> = floated.pages.iter().map(|p| shapes(&p.items).len()).collect();
     assert_eq!(per_page, [0, 0, 1]);
 }
 
