@@ -169,35 +169,48 @@ fn children_of_choice(ac: &El) -> Option<&El> {
 /// Gather `name` children (rows, cells), looking through content controls, custom XML and the
 /// selected alternate-content branch; each with the content controls that open before it and how
 /// many close after it. `pending` holds controls opened but not yet given to an element.
-fn collect<'a>(e: &'a El, name: &str, out: &mut Vec<(&'a El, ControlWrap)>, pending: &mut Vec<ContentControl>, depth: usize) {
-    if depth > 8 {
-        return;
+fn collect<'a>(e: &'a El, name: &str, out: &mut Vec<(&'a El, ControlWrap)>, pending: &mut Vec<ContentControl>, _depth: usize) {
+    enum Frame<'a> {
+        Children(std::slice::Iter<'a, Node>),
+        CloseControl(usize),
     }
-    for k in e.els() {
-        if k.name == name {
-            out.push((k, ControlWrap { open: std::mem::take(pending), close: 0 }));
-        } else if k.name == "w:sdt" {
-            if let Some(c) = k.child("w:sdtContent") {
-                let mut ctl = super::sdt::sdt_pr(k.child("w:sdtPr"), true);
-                ctl.end_pr_xml = super::sdt::sdt_end_pr(k.child("w:sdtEndPr"));
-                let before = out.len();
-                pending.push(ctl);
-                collect(c, name, out, pending, depth + 1);
+    // The XML parser already bounds the owned tree to MAX_DEPTH. Row/cell wrappers must
+    // retain every parsed control too; an independent eight-wrapper cap silently lost rows.
+    // Iterator frames keep storage bounded by tree depth, without recursive collector calls.
+    let mut frames = vec![Frame::Children(e.kids.iter())];
+    while let Some(frame) = frames.pop() {
+        match frame {
+            Frame::CloseControl(before) => {
                 let grew = out.len() > before;
                 match out.last_mut() {
-                    Some((_, w)) if grew => w.close = w.close.saturating_add(1),
-                    // Nothing inside: the control goes (as before).
+                    Some((_, wrap)) if grew => wrap.close = wrap.close.saturating_add(1),
                     _ => {
                         pending.pop();
                     }
                 }
             }
-        } else if k.name == "w:customXml" {
-            collect(k, name, out, pending, depth + 1);
-        } else if k.name == "mc:AlternateContent"
-            && let Some(branch) = children_of_choice(k)
-        {
-            collect(branch, name, out, pending, depth + 1);
+            Frame::Children(mut children) => {
+                let Some(node) = children.next() else { continue };
+                frames.push(Frame::Children(children));
+                let Node::El(k) = node else { continue };
+                if k.name == name {
+                    out.push((k, ControlWrap { open: std::mem::take(pending), close: 0 }));
+                } else if k.name == "w:sdt" {
+                    if let Some(content) = k.child("w:sdtContent") {
+                        let mut control = super::sdt::sdt_pr(k.child("w:sdtPr"), true);
+                        control.end_pr_xml = super::sdt::sdt_end_pr(k.child("w:sdtEndPr"));
+                        pending.push(control);
+                        frames.push(Frame::CloseControl(out.len()));
+                        frames.push(Frame::Children(content.kids.iter()));
+                    }
+                } else if k.name == "w:customXml" {
+                    frames.push(Frame::Children(k.kids.iter()));
+                } else if k.name == "mc:AlternateContent"
+                    && let Some(branch) = children_of_choice(k)
+                {
+                    frames.push(Frame::Children(branch.kids.iter()));
+                }
+            }
         }
     }
 }

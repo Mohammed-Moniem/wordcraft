@@ -19,7 +19,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 
 use crate::para::OBJ;
-use crate::{Block, Blocks, Document, InlineObject, Path, Pos, StoryRef};
+use crate::{Block, Blocks, Document, InlineObject, Paragraph, Part, Path, Pos, StoryRef};
+
+mod interval;
+mod paste;
+mod plan;
+pub use plan::{ControlPlan, ControlWrapPlan, control_plan, control_wrap_plan};
 
 /// Deepest table nesting scanned (matches `walk` in the crate root).
 const MAX_DEPTH: usize = 16;
@@ -507,9 +512,416 @@ fn balance_list(bl: &mut Blocks) -> usize {
     removed
 }
 
+/// Deepest content-control nesting that an edit creates. Each control adds two XML levels;
+/// leave room for the surrounding document, tables and text boxes when a DOCX is reopened.
+pub const MAX_CONTROL_NESTING: usize = 64;
+const MAX_NESTING_WALK: usize = 128;
+// Count every text-box level the existing paste path can copy, rather than stopping at four.
+const MAX_BOX_HOPS: usize = crate::edit::MAX_BOX_DEPTH;
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct NestingWork {
+    pub blocks: usize,
+    pub objects: usize,
+    pub story_scans: usize,
+    pub cache_entries: usize,
+    pub trim_story_scans: usize,
+    pub trim_objects: usize,
+    pub trim_queue_max: usize,
+    pub marker_stack_max: usize,
+    pub outer_edges: usize,
+    pub outer_edge_visits: usize,
+    pub outer_queue_max: usize,
+    pub planner_blocks: usize,
+    pub planner_objects: usize,
+    pub planner_ranges: usize,
+    pub interval_steps: usize,
+    pub placement_updates: usize,
+    pub boundary_steps: usize,
+    pub dependent_visits: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static NESTING_WORK: std::cell::Cell<NestingWork> = std::cell::Cell::new(NestingWork::default());
+}
+
+#[cfg(test)]
+fn note_nesting_work(f: impl FnOnce(&mut NestingWork)) {
+    NESTING_WORK.with(|slot| {
+        let mut work = slot.get();
+        f(&mut work);
+        slot.set(work);
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn take_nesting_work() -> NestingWork {
+    NESTING_WORK.with(std::cell::Cell::take)
+}
+
+/// Visit paragraph starts and positions after markers or text boxes. The optional story id
+/// identifies a box edge at the current local depth, without a second object-offset scan.
+fn nesting_walk(
+    bl: &Blocks,
+    stories: &mut NestingStories<'_>,
+    prefix: &mut Vec<u32>,
+    mut depth: usize,
+    level: usize,
+    hops: usize,
+    f: &mut dyn FnMut(&[u32], usize, usize, usize, Option<u32>),
+) {
+    if level > MAX_NESTING_WALK {
+        // An uncounted subtree cannot be treated as spare nesting room for a new edit.
+        f(prefix, 0, MAX_CONTROL_NESTING + 1, MAX_CONTROL_NESTING + 1, None);
+        return;
+    }
+    let w = OBJ.len_utf8();
+    // Local unmatched closes cannot consume enclosing cell/table controls. The writer
+    // balances each block list, row and cell independently, so the query must do the same.
+    let inherited = depth;
+    let plan = control_plan(bl);
+    for (i, b) in bl.iter().enumerate() {
+        #[cfg(test)]
+        note_nesting_work(|work| work.blocks = work.blocks.saturating_add(1));
+        prefix.push(u32::try_from(i).unwrap_or(u32::MAX));
+        depth = depth.saturating_add(plan.opens.get(i).map_or(0, Vec::len));
+        match &**b {
+            Block::Para(p) => {
+                f(prefix, 0, depth, depth, None);
+                for (off, o) in p.objects_with_offsets() {
+                    #[cfg(test)]
+                    note_nesting_work(|work| work.objects = work.objects.saturating_add(1));
+                    match o {
+                        InlineObject::ControlStart { .. } if plan.inline.get(i).is_some_and(|offsets| offsets.binary_search(&off).is_ok()) => {
+                            depth = depth.saturating_add(1);
+                            f(prefix, off + w, depth, depth, None);
+                        }
+                        InlineObject::ControlEnd if plan.inline.get(i).is_some_and(|offsets| offsets.binary_search(&off).is_ok()) => {
+                            depth = depth.saturating_sub(1).max(inherited);
+                            f(prefix, off + w, depth, depth, None);
+                        }
+                        _ => {
+                            for id in o.text_boxes() {
+                                let peak = depth.saturating_add(stories.peak(id, hops));
+                                f(prefix, off + w, depth, peak, Some(id));
+                            }
+                        }
+                    }
+                }
+            }
+            Block::Table(t) => {
+                f(prefix, 0, depth, depth, None);
+                let mut row_depth = depth;
+                let row_plan = control_wrap_plan(&t.rows.iter().filter(|row| !row.cells.is_empty()).map(|row| &row.controls).collect::<Vec<_>>());
+                let mut serialized_row = 0usize;
+                for (r, row) in t.rows.iter().enumerate() {
+                    // Serialization omits rows without cells, including their wrappers.
+                    if row.cells.is_empty() {
+                        continue;
+                    }
+                    row_depth = row_depth.saturating_add(row.controls.open.len());
+                    prefix.push(u32::try_from(r).unwrap_or(u32::MAX));
+                    f(prefix, 0, row_depth, row_depth, None);
+                    let mut cell_depth = row_depth;
+                    let cell_plan = control_wrap_plan(&row.cells.iter().map(|cell| &cell.controls).collect::<Vec<_>>());
+                    for (c, cell) in row.cells.iter().enumerate() {
+                        cell_depth = cell_depth.saturating_add(cell.controls.open.len());
+                        prefix.push(u32::try_from(c).unwrap_or(u32::MAX));
+                        f(prefix, 0, cell_depth, cell_depth, None);
+                        nesting_walk(&cell.blocks, stories, prefix, cell_depth, level + 1, hops, f);
+                        prefix.pop();
+                        cell_depth = cell_depth.saturating_sub(cell_plan.closes.get(c).copied().unwrap_or(0)).max(row_depth);
+                    }
+                    prefix.pop();
+                    row_depth = row_depth.saturating_sub(row_plan.closes.get(serialized_row).copied().unwrap_or(0)).max(depth);
+                    serialized_row = serialized_row.saturating_add(1);
+                }
+            }
+        }
+        depth = depth.saturating_sub(plan.closes.get(i).copied().unwrap_or(0) as usize).max(inherited);
+        prefix.pop();
+    }
+}
+
+struct NestingStories<'a> {
+    parts: &'a BTreeMap<u32, Part>,
+    peaks: BTreeMap<(u32, usize), usize>,
+    max_hops: usize,
+    unknown_peak: usize,
+}
+
+impl<'a> NestingStories<'a> {
+    fn new(parts: &'a BTreeMap<u32, Part>) -> Self {
+        Self { parts, peaks: BTreeMap::new(), max_hops: MAX_BOX_HOPS, unknown_peak: 0 }
+    }
+
+    fn for_edit(parts: &'a BTreeMap<u32, Part>) -> Self {
+        // An imported story can have more ancestors/descendants than a paste copies. A
+        // selection wrapping it must count those too; unknown tails cannot grant spare room.
+        Self { parts, peaks: BTreeMap::new(), max_hops: MAX_CONTROL_NESTING + 1, unknown_peak: MAX_CONTROL_NESTING + 1 }
+    }
+
+    fn peak(&mut self, id: u32, hops: usize) -> usize {
+        if let Some(&peak) = self.peaks.get(&(id, hops)) {
+            return peak;
+        }
+        let parts = self.parts;
+        let Some(part) = parts.get(&id).filter(|_| hops < self.max_hops) else { return self.unknown_peak };
+        #[cfg(test)]
+        note_nesting_work(|work| work.story_scans = work.story_scans.saturating_add(1));
+        let mut peak = 0;
+        nesting_walk(&part.blocks, self, &mut Vec::new(), 0, 0, hops + 1, &mut |_, _, _, p, _| peak = peak.max(p));
+        self.peaks.insert((id, hops), peak);
+        #[cfg(test)]
+        note_nesting_work(|work| work.cache_entries = work.cache_entries.max(self.peaks.len()));
+        peak
+    }
+}
+
+/// Deepest control nesting in a fragment, including the text-box levels a paste can copy.
+pub fn nesting_peak(bl: &Blocks, parts: &BTreeMap<u32, Part>) -> usize {
+    let mut peak = 0;
+    nesting_walk(bl, &mut NestingStories::new(parts), &mut Vec::new(), 0, 0, 0, &mut |_, _, _, p, _| peak = peak.max(p));
+    peak
+}
+
+/// Cut marker characters and their objects together, walking text, runs and objects once.
+/// Repeated Paragraph::delete calls would rescan and shift a long paragraph for every marker.
+fn cut_control_markers(p: &mut Paragraph, cut: &[(usize, usize)]) {
+    let width = OBJ.len_utf8();
+    let text = std::mem::take(&mut p.text);
+    crate::work::steps(text.len().saturating_add(p.runs.len()).saturating_add(p.objects.len()));
+    let mut kept = String::with_capacity(text.len().saturating_sub(cut.len().saturating_mul(width)));
+    let mut from = 0;
+    for &(off, _) in cut {
+        kept.push_str(text.get(from..off).unwrap_or_default());
+        from = off.saturating_add(width).min(text.len());
+    }
+    kept.push_str(text.get(from..).unwrap_or_default());
+    let mut start = 0usize;
+    let mut next = 0usize;
+    let mut runs = Vec::with_capacity(p.runs.len());
+    for mut run in p.runs.drain(..) {
+        let end = start.saturating_add(run.len).min(text.len());
+        let mut removed = 0usize;
+        while let Some(&(off, _)) = cut.get(next) {
+            if off >= end {
+                break;
+            }
+            let cut_end = off.saturating_add(width);
+            removed = removed.saturating_add(cut_end.min(end).saturating_sub(off.max(start)));
+            if cut_end > end {
+                break;
+            }
+            next += 1;
+        }
+        run.len = end.saturating_sub(start).saturating_sub(removed);
+        if run.len > 0 {
+            runs.push(run);
+        }
+        start = end;
+    }
+    let mut cuts = cut.iter().peekable();
+    let mut objects = Vec::with_capacity(p.objects.len().saturating_sub(cut.len()));
+    for (index, object) in p.objects.drain(..).enumerate() {
+        if cuts.peek().is_some_and(|(_, cut_index)| *cut_index == index) {
+            cuts.next();
+        } else {
+            objects.push(object);
+        }
+    }
+    p.text = kept;
+    p.runs = runs;
+    p.objects = objects;
+    p.normalize();
+    p.touch();
+}
+
+fn trim_control_list(bl: &mut Blocks, mut depth: usize, room: usize, level: usize, boxes: &mut BTreeMap<u32, usize>) -> usize {
+    if level > MAX_NESTING_WALK {
+        return 0;
+    }
+    let mut stack = Vec::new();
+    let mut removed = 0usize;
+    for b in bl.iter_mut() {
+        if let Block::Para(p) = &**b {
+            let mut cut = Vec::new();
+            for (object_index, (off, o)) in p.objects_with_offsets().enumerate() {
+                #[cfg(test)]
+                note_nesting_work(|work| work.trim_objects = work.trim_objects.saturating_add(1));
+                match o {
+                    InlineObject::ControlStart { .. } => {
+                        let drop = depth >= room;
+                        stack.push(drop);
+                        if drop {
+                            cut.push((off, object_index));
+                            removed = removed.saturating_add(1);
+                        } else {
+                            depth += 1;
+                        }
+                    }
+                    InlineObject::ControlEnd => match stack.pop() {
+                        Some(true) => cut.push((off, object_index)),
+                        Some(false) => depth = depth.saturating_sub(1),
+                        None => {}
+                    },
+                    _ => {
+                        for id in o.text_boxes() {
+                            let left = room.saturating_sub(depth);
+                            boxes.entry(id).and_modify(|r| *r = (*r).min(left)).or_insert(left);
+                        }
+                    }
+                }
+                #[cfg(test)]
+                note_nesting_work(|work| work.marker_stack_max = work.marker_stack_max.max(stack.len()));
+            }
+            if !cut.is_empty()
+                && let Block::Para(p) = std::sync::Arc::make_mut(b)
+            {
+                cut_control_markers(p, &cut);
+            }
+        } else if let Block::Table(t) = std::sync::Arc::make_mut(b) {
+            removed = removed.saturating_add(trim_control_open(&mut t.controls, &mut stack, &mut depth, room));
+            let (mut row_stack, mut row_depth) = (Vec::new(), depth);
+            for row in &mut t.rows {
+                if row.cells.is_empty() {
+                    continue;
+                }
+                removed = removed.saturating_add(trim_control_open(&mut row.controls, &mut row_stack, &mut row_depth, room));
+                let (mut cell_stack, mut cell_depth) = (Vec::new(), row_depth);
+                for cell in &mut row.cells {
+                    removed = removed.saturating_add(trim_control_open(&mut cell.controls, &mut cell_stack, &mut cell_depth, room));
+                    removed = removed.saturating_add(trim_control_list(&mut cell.blocks, cell_depth, room, level + 1, boxes));
+                    trim_control_close(&mut cell.controls, &mut cell_stack, &mut cell_depth);
+                }
+                trim_control_close(&mut row.controls, &mut row_stack, &mut row_depth);
+            }
+            trim_control_close(&mut t.controls, &mut stack, &mut depth);
+        }
+    }
+    removed
+}
+
+fn trim_control_open(wrap: &mut ControlWrap, stack: &mut Vec<bool>, depth: &mut usize, room: usize) -> usize {
+    let before = wrap.open.len();
+    wrap.open.retain(|_| {
+        let drop = *depth >= room;
+        stack.push(drop);
+        if !drop {
+            *depth += 1;
+        }
+        !drop
+    });
+    #[cfg(test)]
+    note_nesting_work(|work| work.marker_stack_max = work.marker_stack_max.max(stack.len()));
+    before - wrap.open.len()
+}
+
+fn trim_control_close(wrap: &mut ControlWrap, stack: &mut Vec<bool>, depth: &mut usize) {
+    // Bound work by stored opens, even for a hostile u32::MAX close count. An arbitrary
+    // 10,000-close cap would instead orphan retained opens when many excess controls were cut.
+    let matched = usize::try_from(wrap.close).unwrap_or(usize::MAX).min(stack.len());
+    let mut kept = wrap.close.saturating_sub(u32::try_from(matched).unwrap_or(u32::MAX));
+    for _ in 0..matched {
+        match stack.pop() {
+            Some(true) => {}
+            Some(false) => {
+                *depth = depth.saturating_sub(1);
+                kept = kept.saturating_add(1);
+            }
+            None => {}
+        }
+    }
+    wrap.close = kept;
+}
+
+/// Drop only control markers exceeding the available editing room; content and retained
+/// control properties stay intact. Work-list storage is at most the reachable story count;
+/// each story is re-trimmed only when its room decreases, at most 65 times.
+pub fn trim_nesting(bl: &mut Blocks, parts: &mut BTreeMap<u32, Part>, room: usize) -> usize {
+    let room = room.min(MAX_CONTROL_NESTING);
+    paste::trim_effective(bl, parts, room)
+}
+
 impl Document {
     fn control_stories(&self) -> Vec<StoryRef> {
         std::iter::once(StoryRef::Body).chain(self.parts.keys().map(|k| StoryRef::Part(*k))).collect()
+    }
+
+    /// Deepest control nesting in the selected range, including the most restrictive shape
+    /// that references its story. Existing deep documents are counted, never trimmed on open.
+    pub fn control_nesting(&self, a: &Pos, b: &Pos) -> usize {
+        if a.story != b.story {
+            return MAX_CONTROL_NESTING + 1;
+        }
+        // Paragraph lookup accepts [] as block zero. Compare that alias at its resolved
+        // location; otherwise every [0] traversal event sorts after a caret with path [].
+        let canonical = |p: &Pos| {
+            if p.path.0.is_empty() { Pos::new(p.story, Path::top(0), p.off) } else { p.clone() }
+        };
+        let (a, b) = (canonical(a), canonical(b));
+        let valid = |p: &Pos| self.para_at(p).is_some_and(|para| p.off <= para.len() && para.text.is_char_boundary(p.off));
+        if !valid(&a) || !valid(&b) {
+            return MAX_CONTROL_NESTING + 1;
+        }
+        let (a, b) = if a <= b { (a, b) } else { (b, a) };
+        let Some(bl) = self.story(a.story) else { return MAX_CONTROL_NESTING + 1 };
+        let (from, to) = ((a.path.0.as_slice(), a.off), (b.path.0.as_slice(), b.off));
+        let (mut at, mut peak) = (0, 0);
+        nesting_walk(bl, &mut NestingStories::for_edit(&self.parts), &mut Vec::new(), 0, 0, 0, &mut |path, off, depth, p, _| {
+            if (path, off) <= from {
+                at = depth;
+            } else if (path, off) <= to {
+                peak = peak.max(p);
+            }
+        });
+        let outer = match a.story {
+            StoryRef::Part(id) => self.outer_control_nesting(id),
+            StoryRef::Body => 0,
+        };
+        outer.saturating_add(at.max(peak))
+    }
+
+    fn outer_control_nesting(&self, target: u32) -> usize {
+        let no_parts = BTreeMap::new();
+        let mut graph = BTreeMap::<StoryRef, Vec<(u32, usize)>>::new();
+        for story in self.control_stories() {
+            let Some(bl) = self.story(story) else { continue };
+            let mut edges = Vec::new();
+            nesting_walk(bl, &mut NestingStories::new(&no_parts), &mut Vec::new(), 0, 0, MAX_BOX_HOPS, &mut |_, _, depth, _, id| {
+                if let Some(id) = id {
+                    edges.push((id, depth));
+                }
+            });
+            #[cfg(test)]
+            note_nesting_work(|work| work.outer_edges = work.outer_edges.saturating_add(edges.len()));
+            graph.insert(story, edges);
+        }
+        // Unlike text_box_anchor (navigation's first match), an edit must account for every
+        // shared-story anchor. Monotone capped propagation also terminates on cycles: each
+        // node increases at most 65 times, and no queue contains a node twice.
+        let mut depths: BTreeMap<StoryRef, usize> = graph.keys().map(|&story| (story, 0)).collect();
+        let mut todo: BTreeSet<StoryRef> = graph.keys().copied().collect();
+        #[cfg(test)]
+        note_nesting_work(|work| work.outer_queue_max = work.outer_queue_max.max(todo.len()));
+        while let Some(story) = todo.pop_first() {
+            let depth = depths.get(&story).copied().unwrap_or(0);
+            for &(id, inner) in graph.get(&story).into_iter().flatten() {
+                #[cfg(test)]
+                note_nesting_work(|work| work.outer_edge_visits = work.outer_edge_visits.saturating_add(1));
+                let Some(current) = depths.get_mut(&StoryRef::Part(id)) else { continue };
+                let next = depth.saturating_add(inner).min(MAX_CONTROL_NESTING + 1);
+                if next > *current {
+                    *current = next;
+                    todo.insert(StoryRef::Part(id));
+                }
+            }
+            #[cfg(test)]
+            note_nesting_work(|work| work.outer_queue_max = work.outer_queue_max.max(todo.len()));
+        }
+        depths.get(&StoryRef::Part(target)).copied().unwrap_or(0)
     }
 
     /// The whole content controls of a story (around paragraph content), in the order they close.
