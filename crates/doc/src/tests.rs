@@ -1,6 +1,7 @@
 use super::*;
 use std::sync::Arc;
 
+mod control_nesting;
 mod note_conversion;
 
 #[test]

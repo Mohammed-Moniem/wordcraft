@@ -1,5 +1,6 @@
 use super::toc::written_toc_span;
 use super::{Block, Blocks, CharProps, MAX_DEPTH, PartRels, Table, W, Writer, tblpr, tcpr, trpr, twips};
+use wordcraft_doc::control::control_wrap_plan;
 
 impl Writer<'_> {
     fn write_trailing_para(&mut self, w: &mut W, depth: usize) {
@@ -105,44 +106,32 @@ impl Writer<'_> {
         w.close("w:tblGrid");
         // Controls around rows and cells (repeating sections): opens and closes balanced
         // whatever editing left, the ones still open closed at the end.
-        let mut open_rows = 0u32;
-        for r in rows {
+        let row_plan = control_wrap_plan(&rows.iter().map(|row| &row.controls).collect::<Vec<_>>());
+        for (row_index, r) in rows.into_iter().enumerate() {
             for c in &r.controls.open {
                 crate::write::sdt::open(w, c);
-                open_rows += 1;
             }
             w.open("w:tr", &[]);
             let chg = r.props.fmt_change.as_ref().map(|c| self.change_attrs(c.rev));
             trpr(w, &r.props, chg.as_ref());
-            let mut open_cells = 0u32;
-            for c in &r.cells {
+            let cell_plan = control_wrap_plan(&r.cells.iter().map(|cell| &cell.controls).collect::<Vec<_>>());
+            for (cell_index, c) in r.cells.iter().enumerate() {
                 for ctl in &c.controls.open {
                     crate::write::sdt::open(w, ctl);
-                    open_cells += 1;
                 }
                 w.open("w:tc", &[]);
                 let chg = c.props.fmt_change.as_ref().map(|c| self.change_attrs(c.rev));
                 tcpr(w, &c.props, chg.as_ref());
                 self.blocks(w, &c.blocks, rels, false, depth + 1);
                 w.close("w:tc");
-                let n = c.controls.close.min(open_cells);
-                for _ in 0..n {
+                for _ in 0..cell_plan.closes.get(cell_index).copied().unwrap_or(0) {
                     crate::write::sdt::close(w);
                 }
-                open_cells -= n;
-            }
-            for _ in 0..open_cells {
-                crate::write::sdt::close(w);
             }
             w.close("w:tr");
-            let n = r.controls.close.min(open_rows);
-            for _ in 0..n {
+            for _ in 0..row_plan.closes.get(row_index).copied().unwrap_or(0) {
                 crate::write::sdt::close(w);
             }
-            open_rows -= n;
-        }
-        for _ in 0..open_rows {
-            crate::write::sdt::close(w);
         }
         w.close("w:tbl");
     }

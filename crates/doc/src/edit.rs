@@ -2,11 +2,12 @@
 //! paragraphs and tables, apply character/paragraph formatting, copy a range to a fragment and
 //! paste a fragment.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::control::{self, MAX_CONTROL_NESTING};
 use crate::para::{InlineObject, Run};
 use crate::props::{CharProps, ParaProps};
 use crate::{Block, Blocks, DocError, Document, Paragraph, Part, PartKind, Path, Pos, Result, para_block};
@@ -185,7 +186,7 @@ fn fit_tables(b: Block, room: usize, out: &mut Vec<Block>) {
 }
 
 /// Nesting limit when following text boxes inside text boxes.
-const MAX_BOX_DEPTH: usize = 8;
+pub(crate) const MAX_BOX_DEPTH: usize = 8;
 /// Most text box stories one paste may create (hostile documents can fan out).
 const MAX_PASTED_BOXES: usize = 4096;
 /// Most text box content (estimated bytes, see [`block_cost`]) one paste may copy: thousands of
@@ -1216,9 +1217,13 @@ impl Document {
 
     /// Copies of the text box stories shapes in `blocks` show, nested boxes included.
     fn text_box_parts(&self, blocks: &[Block]) -> BTreeMap<u32, Part> {
-        let mut out = BTreeMap::new();
+        self.with_text_box_parts(blocks, BTreeMap::new())
+    }
+
+    /// Include stories already in the fragment and missing references copied from this document.
+    fn with_text_box_parts(&self, blocks: &[Block], mut out: BTreeMap<u32, Part>) -> BTreeMap<u32, Part> {
         let mut todo = Vec::new();
-        for b in blocks {
+        for b in blocks.iter().chain(out.values().flat_map(|p| p.blocks.iter().map(|b| &**b))) {
             each_para(b, 0, &mut |p| todo.extend(box_ids(p)));
         }
         while let Some(id) = todo.pop() {
@@ -1391,12 +1396,35 @@ impl Document {
         if blocks.is_empty() {
             return Ok(pos.clone());
         }
-        if self.para_at(pos).is_none() {
-            return Err(DocError::BadPath(pos.path.to_string()));
+        let Some(target) = self.para_at(pos) else { return Err(DocError::BadPath(pos.path.to_string())) };
+        if pos.off > target.len() || !target.text.is_char_boundary(pos.off) {
+            // Story adoption below mutates parts. Reject bad offsets before that first write,
+            // rather than leaving copied stories behind when split_off rejects the position.
+            return Err(DocError::BadOffset(pos.off));
         }
+        // Promotion to whole-paragraph wrappers depends on both merged endpoints, not just
+        // on the caret. Stage the exact edit first, then trim only the newly pasted pairs.
+        let pos = if pos.path.0.is_empty() { Pos::new(pos.story, Path::top(0), pos.off) } else { pos.clone() };
+        let original_parts: BTreeSet<_> = self.parts.keys().copied().collect();
+        let mut parts = self.with_text_box_parts(&blocks, frag.parts.clone());
+        let mut fitted: Blocks = blocks.into_iter().map(Arc::new).collect();
+        // Bound a fragment on its own before adoption, including syntactically unpaired
+        // hostile ranges. The second admission below accounts for its exact destination.
+        if control::nesting_peak(&fitted, &parts) > MAX_CONTROL_NESTING {
+            control::trim_nesting(&mut fitted, &mut parts, MAX_CONTROL_NESTING);
+        }
+        let blocks = fitted.into_iter().map(Arc::unwrap_or_clone).collect();
+        let mut staged = self.clone();
+        let end = staged.insert_prepared_fragment(&pos, blocks, &parts)?;
+        let end = staged.trim_pasted_controls(&pos, end, &original_parts);
+        *self = staged;
+        Ok(end)
+    }
+
+    fn insert_prepared_fragment(&mut self, pos: &Pos, mut blocks: Vec<Block>, parts: &BTreeMap<u32, Part>) -> Result<Pos> {
         // Pasted text boxes get stories of their own (never shared with the copy's source).
         let mut budget = BoxBudget::new();
-        self.adopt_text_boxes(&mut blocks, &frag.parts, 0, &mut budget);
+        self.adopt_text_boxes(&mut blocks, parts, 0, &mut budget);
         if budget.skipped > 0 {
             // Once per paste, not once per box (review of #3874).
             log::warn!(

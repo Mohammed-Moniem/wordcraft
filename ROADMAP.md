@@ -1,5 +1,9 @@
 # WordCraft roadmap
 
+> **Content-control port revision:** 2026-11-08 · Shared model/DOCX placement counts whole-paragraph promotion at both merged paste boundaries; local-close and position-alias guards remain in place.
+
+New controls and pasted controls share a 64-level editing budget across table wraps and text boxes. A staged paste protects existing destination controls and stories while trimming only new excess pairs using effective serialized intervals. Existing imported deep controls remain intact. Regression cases observe saved XML depth, both merged endpoints, retained inline/shifted controls and bounded incremental cascade work. Native/CI/WASM validation and full product acceptance remain separate.
+
 > **Highlight update:** 2026-10-25 · Highlight shortcut toggles the last chosen colour off when the whole selection has it; explicit colour commands remain setters (#4085). Readiness estimates unchanged.
 
 **Stage: alpha** · next: beta, ~15 points (60% → 75% ready for real work) and ~150–230 h away
